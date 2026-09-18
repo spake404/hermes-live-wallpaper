@@ -814,7 +814,10 @@ function SettingsPage({ ctx }) {
                                     preload: 'none',
                                     className: 'h-full w-full object-cover',
                                     onMouseEnter: e => {
-                                      try { e.target.play() } catch (err) {}
+                                      // play() 返回 Promise：快速移入移出会以 AbortError 拒绝，
+                                      // 同步 try/catch 抓不到，必须显式 catch，否则控制台报未捕获拒绝
+                                      const p = e.target.play()
+                                      if (p && p.catch) p.catch(() => {})
                                     },
                                     onMouseLeave: e => {
                                       try { e.target.pause() } catch (err) {}
