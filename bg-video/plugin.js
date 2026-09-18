@@ -16,6 +16,9 @@ import {
 const ID = 'bg-video'
 
 let DEFAULT_PATH = ''
+// 当前已真正写入媒体元素的源；未变化则永不重设 src
+// （Chromium 对同值 src 赋值也会触发重新加载 → 拖动滑块时画面闪黑）
+let lastAppliedSrc = ''
 
 async function resolveDefaultPath() {
   if (DEFAULT_PATH) return DEFAULT_PATH
@@ -145,57 +148,112 @@ function hasBg(el) {
   return bgAlpha(c) >= 0.5 || (i && i !== 'none')
 }
 
-function nukePseudo(el) {
-  const rid = 'ap' + Math.random().toString(36).slice(2, 7)
-  el.dataset.ariaRid = rid
+// ── 伪元素压制：类名方案，幂等且样式表大小恒定 ──────────────────────
+// 旧实现每次调用生成随机 rid 并 textContent += 追加规则：随机 id 让旧规则永不
+// 再匹配（纯死规则），且 += 会整体重新解析整张样式表 → 规则数随时间无上限增长。
+// 现在改成固定类名 + 只写一次的静态规则，类切换天然幂等。
+const TRANSPARENT_CLASS = 'aria-bg-nobg'
+const PSEUDO_RULE = `.${TRANSPARENT_CLASS}::before,.${TRANSPARENT_CLASS}::after{background:transparent!important;}`
+
+function ensurePseudoRule() {
   let st = document.getElementById('aria-pseudo-style')
   if (!st) {
     st = document.createElement('style')
     st.id = 'aria-pseudo-style'
     document.head.appendChild(st)
   }
-  st.textContent += `\n[data-aria-rid="${rid}"]::before,[data-aria-rid="${rid}"]::after{background:transparent!important;}`
+  // 快速路径：规则数已正确就直接返回（O(1)，不必每轮比较整串文本）
+  const n = st.sheet && st.sheet.cssRules ? st.sheet.cssRules.length : -1
+  if (n === 1 && st.textContent === PSEUDO_RULE) return
+  // 整体覆盖（非追加）：老版本累积的死规则会被一次性清空
+  if (st.textContent !== PSEUDO_RULE) st.textContent = PSEUDO_RULE
 }
 
+function nukePseudo(el) {
+  if (!el || el.classList.contains(TRANSPARENT_CLASS)) return
+  ensurePseudoRule()
+  el.classList.add(TRANSPARENT_CLASS)
+}
+
+// 已净化 / 已分类缓存：避免每轮重复 getComputedStyle + getBoundingClientRect
+let cleanedNodes = new WeakSet()
+let classifiedNodes = new WeakSet()
+// 已识别的侧栏容器（需要每轮为新增后代补净化）
+let sidebarRoots = []
+
 function deepCleanSidebar(el) {
-  const kids = el.querySelectorAll('*')
-  for (const k of kids) {
+  // 阶段一：只读，收集需要净化的节点
+  const targets = []
+  for (const k of el.querySelectorAll('*')) {
     if (k.id === 'aria-bg-media' || k.id === 'aria-bg-badge' || k.id === 'aria-bg-style') continue
+    if (cleanedNodes.has(k)) continue
+    cleanedNodes.add(k)
     const cs = getComputedStyle(k)
     const c = cs.backgroundColor || ''
     const i = cs.backgroundImage || ''
-    if (bgAlpha(c) >= 0.3 || (i && i !== 'none')) {
-      k.style.setProperty('background', 'transparent', 'important')
-      nukePseudo(k)
-    }
+    if (bgAlpha(c) >= 0.3 || (i && i !== 'none')) targets.push(k)
+  }
+  // 阶段二：只写
+  for (const k of targets) {
+    k.style.setProperty('background', 'transparent', 'important')
+    nukePseudo(k)
   }
 }
 
-function processBackgrounds() {
+// force=true 时清空缓存做全量重扫（引导 / 配置变更 / DOM 变更 / 尺寸变更 / 兜底）。
+// force=false 时复用缓存，空闲状态几乎零成本。
+function processBackgrounds(force = false) {
   if (!cfg.enabled) return { cleared: 0, tinted: 0 }
+  if (force) {
+    classifiedNodes = new WeakSet()
+    cleanedNodes = new WeakSet()
+    sidebarRoots = []
+  }
   const vw = window.innerWidth
   const vh = window.innerHeight
-  let cleared = 0
-  let tinted = 0
-  const all = document.querySelectorAll('body *')
-  for (const el of all) {
+  const sbg = hexToRgba(cfg.sidebarColor, cfg.sidebarAlpha)
+  // 每轮顺手自愈规则表：如果被历史遗留的旧循环（热重载孤儿）追加过规则，
+  // 这里会立刻恢复到 1 条。规则数正确时是 O(1) 返回。
+  ensurePseudoRule()
+
+  // ── 阶段一：只读，不写任何样式（避免 Layout Thrashing）──────────
+  const plan = []
+  for (const el of document.querySelectorAll('body *')) {
     if (el.id === 'aria-bg-media' || el.id === 'aria-bg-badge' || el.id === 'aria-bg-style') continue
+    if (classifiedNodes.has(el)) continue
     const r = el.getBoundingClientRect()
     if (r.width < 60 || r.height < 60) continue
-    if (!hasBg(el)) continue
     const wRatio = r.width / vw
     const hRatio = r.height / vh
-    if (wRatio >= 0.5 && hRatio >= 0.4) {
+    const isMain = wRatio >= 0.5 && hRatio >= 0.4
+    const isSide = wRatio >= 0.08 && wRatio <= 0.48 && hRatio >= 0.55
+    if (!isMain && !isSide) continue
+    if (!hasBg(el)) continue
+    plan.push({ el, isMain, isSide })
+  }
+
+  // ── 阶段二：只写 ────────────────────────────────────────────────
+  let cleared = 0
+  let tinted = 0
+  for (const { el, isMain, isSide } of plan) {
+    if (isMain) {
       el.style.setProperty('background', 'transparent', 'important')
+      nukePseudo(el)
       cleared++
-      nukePseudo(el)
-    } else if (wRatio >= 0.08 && wRatio <= 0.48 && hRatio >= 0.55) {
-      const sbg = hexToRgba(cfg.sidebarColor, cfg.sidebarAlpha)
+      classifiedNodes.add(el)
+    } else if (isSide) {
       el.style.setProperty('background', sbg, 'important')
-      tinted++
       nukePseudo(el)
-      deepCleanSidebar(el)
+      tinted++
+      classifiedNodes.add(el)
+      if (!sidebarRoots.includes(el)) sidebarRoots.push(el)
     }
+  }
+  // 侧栏后代要在每次增量轮次都补齐（新会话行/新按钮会带自己的底色），
+  // 但靠 cleanedNodes 保证同一个节点只算一次 getComputedStyle。
+  for (const root of sidebarRoots) {
+    if (!root.isConnected) continue
+    deepCleanSidebar(root)
   }
   return { cleared, tinted }
 }
@@ -249,12 +307,22 @@ function upsertMedia() {
       margin: '0'
     })
     document.body.appendChild(el)
+    lastAppliedSrc = '' // 新元素没有任何源，强制下面重新赋值
     if (wantTag === 'VIDEO') {
       const pr = el.play()
       if (pr && pr.catch) pr.catch(() => {})
     }
   }
-  el.src = toFileURL(cfg.videoPath)
+  // 只有源真的变化时才写 src + 起播
+  const nextSrc = toFileURL(cfg.videoPath)
+  if (nextSrc !== lastAppliedSrc) {
+    lastAppliedSrc = nextSrc
+    el.src = nextSrc
+    if (wantTag === 'VIDEO') {
+      const pr = el.play()
+      if (pr && pr.catch) pr.catch(() => {})
+    }
+  }
   el.style.left = '0'
   el.style.width = '100vw'
   el.style.objectPosition = cfg.videoPosition + '% 50%'
@@ -297,7 +365,7 @@ function injectLoop() {
   if (typeof document === 'undefined' || !document.body) return
   ensureStyle()
   upsertMedia()
-  processBackgrounds()
+  processBackgrounds(true)
 }
 
 // ── 设置页组件 ────────────────────────────────────────────────────
@@ -308,6 +376,7 @@ function SettingsPage({ ctx }) {
   const [loadingFiles, setLoadingFiles] = useState(false)
   const [folderError, setFolderError] = useState('')
   const [activeTab, setActiveTab] = useState('all') // 'all' | 'image' | 'video'
+  const [visibleCount, setVisibleCount] = useState(60) // 网格首屏限量，避免一次挂载数百个节点
 
   useEffect(() => {
     const t = setTimeout(() => setSaved(false), 2000)
@@ -366,6 +435,7 @@ function SettingsPage({ ctx }) {
       if (window.hermesDesktop?.readDir) {
         const media = await scanDirectoryRecursive(dir)
         setFolderFiles(media)
+        setVisibleCount(60) // 新目录重新分页
         if (media.length === 0) {
           // 尝试单层读一次看看有没有错误提示
           const checkRes = await window.hermesDesktop.readDir(dir)
@@ -432,15 +502,36 @@ function SettingsPage({ ctx }) {
     }
   }, [])
 
+  // 侧栏色调变更去抖：拖动滑块时每个事件都全量重排会让设置页手感发滞
+  let sidebarDebounce = null
+  const applySidebarSoon = () => {
+    if (sidebarDebounce) clearTimeout(sidebarDebounce)
+    sidebarDebounce = setTimeout(() => {
+      sidebarDebounce = null
+      processBackgrounds(true)
+    }, 120)
+  }
+
   const set = (k, val) => {
     setForm(f => ({ ...f, [k]: val }))
-    if (k === 'enabled' || k === 'opacity' || k === 'videoPosition' || k === 'videoPath' || k === 'showBadge') {
+    if (k === 'opacity' || k === 'videoPosition') {
+      // 纯视觉参数：只改样式，绝不走 upsertMedia（否则会重设 src 重载视频）
+      cfg[k] = val
+      const m = document.getElementById('aria-bg-media')
+      if (m) {
+        if (k === 'opacity') m.style.opacity = String(val)
+        else m.style.objectPosition = val + '% 50%'
+      }
+      return
+    }
+    if (k === 'enabled' || k === 'videoPath' || k === 'showBadge') {
       cfg[k] = val
       upsertMedia()
+      return
     }
     if (k === 'sidebarAlpha' || k === 'sidebarColor') {
       cfg[k] = val
-      processBackgrounds()
+      applySidebarSoon()
     }
   }
 
@@ -521,6 +612,12 @@ function SettingsPage({ ctx }) {
     })
 
   const currentFileName = getBaseName(form.videoPath)
+  // 分类过滤结果在组件体内算一次，网格与"加载更多"按钮共用
+  const filteredFiles = folderFiles.filter(f => {
+    if (activeTab === 'image') return f.isImage
+    if (activeTab === 'video') return f.isVideo
+    return true
+  })
 
   return jsxs('div', {
     className: 'mx-auto flex h-full max-w-3xl flex-col gap-6 overflow-y-auto p-8',
@@ -621,7 +718,10 @@ function SettingsPage({ ctx }) {
                     children: [
                       jsx('button', {
                         type: 'button',
-                        onClick: () => setActiveTab('all'),
+                        onClick: () => {
+                          setActiveTab('all')
+                          setVisibleCount(60)
+                        },
                         className: `px-2.5 py-1 rounded-md text-xs transition-colors cursor-pointer ${
                           activeTab === 'all'
                             ? 'bg-(--ui-accent) text-white font-medium shadow-xs'
@@ -631,7 +731,10 @@ function SettingsPage({ ctx }) {
                       }),
                       jsx('button', {
                         type: 'button',
-                        onClick: () => setActiveTab('image'),
+                        onClick: () => {
+                          setActiveTab('image')
+                          setVisibleCount(60)
+                        },
                         className: `px-2.5 py-1 rounded-md text-xs transition-colors cursor-pointer ${
                           activeTab === 'image'
                             ? 'bg-(--ui-accent) text-white font-medium shadow-xs'
@@ -641,7 +744,10 @@ function SettingsPage({ ctx }) {
                       }),
                       jsx('button', {
                         type: 'button',
-                        onClick: () => setActiveTab('video'),
+                        onClick: () => {
+                          setActiveTab('video')
+                          setVisibleCount(60)
+                        },
                         className: `px-2.5 py-1 rounded-md text-xs transition-colors cursor-pointer ${
                           activeTab === 'video'
                             ? 'bg-(--ui-accent) text-white font-medium shadow-xs'
@@ -658,11 +764,8 @@ function SettingsPage({ ctx }) {
               }),
 
               (() => {
-                const displayFiles = folderFiles.filter(f => {
-                  if (activeTab === 'image') return f.isImage
-                  if (activeTab === 'video') return f.isVideo
-                  return true
-                })
+                const displayFiles = filteredFiles
+                const shown = displayFiles.slice(0, visibleCount)
 
                 if (displayFiles.length === 0) {
                   if (loadingFiles) return null
@@ -676,7 +779,7 @@ function SettingsPage({ ctx }) {
 
                 return jsx('div', {
                   className: 'grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-3 max-h-72 overflow-y-auto p-2 rounded-lg border border-(--ui-border)/60 bg-black/25',
-                  children: displayFiles.map(file => {
+                  children: shown.map(file => {
                     const isSelected = form.videoPath === file.path
                     const isImg = file.isImage
                     const fileUrl = toFileURL(file.path)
@@ -697,6 +800,8 @@ function SettingsPage({ ctx }) {
                             ? jsx('img', {
                                 src: fileUrl,
                                 alt: file.name,
+                                loading: 'lazy',
+                                decoding: 'async',
                                 className: 'h-full w-full object-cover transition-transform group-hover:scale-105'
                               })
                             : jsxs('div', {
@@ -706,6 +811,7 @@ function SettingsPage({ ctx }) {
                                     src: fileUrl,
                                     muted: true,
                                     playsInline: true,
+                                    preload: 'none',
                                     className: 'h-full w-full object-cover',
                                     onMouseEnter: e => {
                                       try { e.target.play() } catch (err) {}
@@ -746,7 +852,16 @@ function SettingsPage({ ctx }) {
                     })
                   })
                 })
-              })()
+              })(),
+              filteredFiles.length > visibleCount
+                ? jsx('button', {
+                    type: 'button',
+                    onClick: () => setVisibleCount(c => c + 60),
+                    className:
+                      'w-full rounded-md border border-(--ui-border) bg-white/5 py-1.5 text-xs text-(--ui-text-secondary) transition-colors cursor-pointer hover:bg-white/10',
+                    children: `加载更多（剩余 ${filteredFiles.length - visibleCount} 个，已显示 ${visibleCount} / ${filteredFiles.length}）`
+                  })
+                : null
             ]
           })
         ]
@@ -869,16 +984,56 @@ export default {
   register(ctx) {
     loadCfg(ctx)
 
+    ensurePseudoRule()
+
+    // ── 背景维护：事件驱动为主，低频轮询仅作兜底 ────────────────────
+    // 旧实现是 1.5s 全量 DOM 遍历 + 强制同步重排，且定时器从未回收：
+    // 每次热重载都会遗留一份旧循环继续跑。
     if (typeof document !== 'undefined') {
+      const prev = globalThis.__ariaBgVideoTimer
+      if (prev) clearInterval(prev)
+
       let booted = false
-      setInterval(() => {
-        if (!booted && document.body) {
+      let refreshTimer = null
+      let tick = 0
+
+      // 任何 DOM 变更都只置脏标记并去抖，绝不在观察者回调里做全量重排。
+      // 增量（force=false）：只测量新出现的节点，已分类的走 WeakSet 跳过。
+      const scheduleRefresh = () => {
+        if (refreshTimer) return
+        refreshTimer = setTimeout(() => {
+          refreshTimer = null
+          if (booted) processBackgrounds(false)
+        }, 400)
+      }
+
+      let observer = null
+      const onResize = () => processBackgrounds(true)
+
+      const ticking = setInterval(() => {
+        if (document.visibilityState !== 'visible') return
+        if (!booted) {
+          if (!document.body) return
           booted = true
           injectLoop()
-        } else if (booted) {
-          processBackgrounds()
+          observer = new MutationObserver(scheduleRefresh)
+          observer.observe(document.body, { childList: true, subtree: true })
+          window.addEventListener('resize', onResize)
+          return
         }
-      }, 1500)
+        // 兜底：默认走缓存（几乎零成本），每 12 拍做一次全量校验
+        tick += 1
+        processBackgrounds(tick % 12 === 0)
+      }, 5000)
+
+      globalThis.__ariaBgVideoTimer = ticking
+      ctx.onDispose(() => {
+        clearInterval(ticking)
+        if (refreshTimer) clearTimeout(refreshTimer)
+        if (observer) observer.disconnect()
+        window.removeEventListener('resize', onResize)
+        if (globalThis.__ariaBgVideoTimer === ticking) globalThis.__ariaBgVideoTimer = null
+      })
     }
 
     // 设置页路由
